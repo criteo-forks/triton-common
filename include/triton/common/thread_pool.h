@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <queue>
@@ -47,10 +48,9 @@ class ThreadPool {
   void Enqueue(Task&& task);
 
   // Returns the number of tasks waiting in the queue
-  size_t TaskQueueSize()
+  size_t TaskQueueSize() const
   {
-    std::lock_guard<std::mutex> lk(queue_mtx_);
-    return task_queue_.size();
+    return queue_size_.load(std::memory_order_relaxed);
   }
 
   // Returns the number of threads in thread pool
@@ -60,6 +60,8 @@ class ThreadPool {
   std::queue<Task> task_queue_;
   std::mutex queue_mtx_;
   std::condition_variable cv_;
+  std::atomic<size_t> queue_size_{0};
+  size_t idle_workers_ = 0;
   std::vector<std::thread> workers_;
   // If true, tells pool to stop accepting work and tells awake worker threads
   // to exit when no tasks are left on the queue.

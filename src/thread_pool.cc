@@ -43,13 +43,18 @@ ThreadPool::ThreadPool(size_t thread_count)
       {
         std::unique_lock<std::mutex> lk(queue_mtx_);
         // Wake if there's a task to do, or the pool has been stopped.
-        cv_.wait(lk, [&]() { return !task_queue_.empty() || stop_; });
+        while (task_queue_.empty() && !stop_) {
+          ++idle_workers_;
+          cv_.wait(lk);
+          --idle_workers_;
+        }
         // Exit condition
         if (stop_ && task_queue_.empty()) {
           break;
         }
         task = std::move(task_queue_.front());
         task_queue_.pop();
+        queue_size_.fetch_sub(1, std::memory_order_relaxed);
       }
 
       // Execute task - ensure function has a valid target
@@ -82,6 +87,7 @@ ThreadPool::~ThreadPool()
 void
 ThreadPool::Enqueue(Task&& task)
 {
+  bool wake = false;
   {
     std::lock_guard<std::mutex> lk(queue_mtx_);
     // Don't accept more work if pool is shutting down
@@ -89,10 +95,14 @@ ThreadPool::Enqueue(Task&& task)
       return;
     }
     task_queue_.push(std::move(task));
+    queue_size_.fetch_add(1, std::memory_order_relaxed);
+    wake = (idle_workers_ != 0);
   }
   // Only wake one thread per task
   // Todo: DLIS-3859 if ThreadPool gets used more.
-  cv_.notify_one();
+  if (wake) {
+    cv_.notify_one();
+  }
 }
 
 }}  // namespace triton::common
