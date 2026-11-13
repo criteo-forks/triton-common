@@ -31,77 +31,130 @@
 namespace triton { namespace common {
 
 ThreadPool::ThreadPool(size_t thread_count)
+    : shard_count_(thread_count)
 {
   if (!thread_count) {
     throw std::invalid_argument("Thread count must be greater than zero.");
   }
 
-  // Define infinite loop for each thread to wait for a task to complete
-  const auto worker_loop = [this]() {
-    while (true) {
-      Task task;
-      {
-        std::unique_lock<std::mutex> lk(queue_mtx_);
-        // Wake if there's a task to do, or the pool has been stopped.
-        while (task_queue_.empty() && !stop_) {
-          ++idle_workers_;
-          cv_.wait(lk);
-          --idle_workers_;
-        }
-        // Exit condition
-        if (stop_ && task_queue_.empty()) {
-          break;
-        }
-        task = std::move(task_queue_.front());
-        task_queue_.pop();
-        queue_size_.fetch_sub(1, std::memory_order_relaxed);
-      }
-
-      // Execute task - ensure function has a valid target
-      if (task) {
-        task();
-      }
-    }
-  };
-
+  shards_.reset(new Shard[thread_count]);
   workers_.reserve(thread_count);
   for (size_t i = 0; i < thread_count; ++i) {
-    workers_.emplace_back(worker_loop);
+    workers_.emplace_back([this, i]() { WorkerLoop(i); });
   }
 }
 
 ThreadPool::~ThreadPool()
 {
-  {
-    std::lock_guard<std::mutex> lk(queue_mtx_);
-    // Signal to each worker that it should exit loop when tasks are finished
-    stop_ = true;
+  for (size_t i = 0; i < shard_count_; ++i) {
+    std::lock_guard<std::mutex> lk(shards_[i].mtx);
+    shards_[i].stop = true;
   }
-  // Wake all threads to clean up
-  cv_.notify_all();
+  for (size_t i = 0; i < shard_count_; ++i) {
+    shards_[i].cv.notify_all();
+  }
   for (auto& t : workers_) {
     t.join();
+  }
+}
+
+bool
+ThreadPool::Steal(size_t index, Task& task)
+{
+  bool contended = false;
+  for (int pass = 0; pass < 2; ++pass) {
+    for (size_t k = 1; k < shard_count_; ++k) {
+      Shard& victim = shards_[(index + k) % shard_count_];
+      std::unique_lock<std::mutex> lk(victim.mtx, std::defer_lock);
+      if (pass == 0) {
+        if (!lk.try_lock()) {
+          contended = true;
+          continue;
+        }
+      } else {
+        lk.lock();
+      }
+      if (!victim.tasks.empty()) {
+        task = std::move(victim.tasks.front());
+        victim.tasks.pop_front();
+        queue_size_.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+      }
+    }
+    if (!contended) {
+      break;
+    }
+  }
+  return false;
+}
+
+void
+ThreadPool::WorkerLoop(size_t index)
+{
+  Shard& own = shards_[index];
+  while (true) {
+    Task task;
+    bool stolen = false;
+    {
+      std::unique_lock<std::mutex> lk(own.mtx);
+      if (own.tasks.empty() && !own.stop) {
+        lk.unlock();
+        stolen = Steal(index, task);
+        if (!stolen) {
+          lk.lock();
+          while (own.tasks.empty() && !own.stop) {
+            own.waiting = true;
+            own.idle.store(true, std::memory_order_relaxed);
+            own.cv.wait(lk);
+            own.waiting = false;
+            own.idle.store(false, std::memory_order_relaxed);
+          }
+        }
+      }
+      if (!stolen) {
+        if (own.tasks.empty()) {
+          break;
+        }
+        task = std::move(own.tasks.front());
+        own.tasks.pop_front();
+        queue_size_.fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
+
+    if (task) {
+      task();
+    }
   }
 }
 
 void
 ThreadPool::Enqueue(Task&& task)
 {
+  const size_t start =
+      next_shard_.fetch_add(1, std::memory_order_relaxed) % shard_count_;
+  size_t target = start;
+  for (size_t k = 0; k < shard_count_; ++k) {
+    const size_t candidate = (start + k) % shard_count_;
+    if (shards_[candidate].idle.load(std::memory_order_relaxed)) {
+      target = candidate;
+      break;
+    }
+  }
+
+  Shard& shard = shards_[target];
   bool wake = false;
   {
-    std::lock_guard<std::mutex> lk(queue_mtx_);
+    std::lock_guard<std::mutex> lk(shard.mtx);
     // Don't accept more work if pool is shutting down
-    if (stop_) {
+    if (shard.stop) {
       return;
     }
-    task_queue_.push(std::move(task));
+    shard.tasks.push_back(std::move(task));
     queue_size_.fetch_add(1, std::memory_order_relaxed);
-    wake = (idle_workers_ != 0);
+    wake = shard.waiting;
   }
-  // Only wake one thread per task
-  // Todo: DLIS-3859 if ThreadPool gets used more.
   if (wake) {
-    cv_.notify_one();
+    shard.cv.notify_one();
   }
 }
 

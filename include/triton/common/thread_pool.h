@@ -27,9 +27,13 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <queue>
 #include <thread>
+#include <vector>
 
 namespace triton { namespace common {
 
@@ -57,15 +61,23 @@ class ThreadPool {
   size_t Size() const { return workers_.size(); }
 
  private:
-  std::queue<Task> task_queue_;
-  std::mutex queue_mtx_;
-  std::condition_variable cv_;
+  struct alignas(64) Shard {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<Task> tasks;
+    bool waiting = false;
+    bool stop = false;
+    std::atomic<bool> idle{false};
+  };
+
+  void WorkerLoop(size_t index);
+  bool Steal(size_t index, Task& task);
+
+  size_t shard_count_;
+  std::unique_ptr<Shard[]> shards_;
+  std::atomic<size_t> next_shard_{0};
   std::atomic<size_t> queue_size_{0};
-  size_t idle_workers_ = 0;
   std::vector<std::thread> workers_;
-  // If true, tells pool to stop accepting work and tells awake worker threads
-  // to exit when no tasks are left on the queue.
-  bool stop_ = false;
 };
 
 }}  // namespace triton::common
